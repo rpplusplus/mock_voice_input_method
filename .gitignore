@@ -1,0 +1,16 @@
+# Local daemon build output
+/mock-voice-daemon
+
+# Environment and local config
+.env
+.env.*
+!.env.example
+
+# OS/editor noise
+.DS_Store
+*.swp
+*.swo
+
+# Build/test caches
+*.test
+coverage.out
