@@ -14,3 +14,4 @@
 # Build/test caches
 *.test
 coverage.out
+macos-helper/.build/

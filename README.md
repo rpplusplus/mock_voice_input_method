@@ -1,38 +1,54 @@
-# Linux/KDE Wayland 语音输入 Daemon 设计
+# Mock Voice Input Method
 
-## 目标
+一个局域网语音输入实验：手机端负责录入/发送文本，桌面端 daemon 负责把文本粘贴到当前焦点窗口。
 
-这个项目先验证一个很小的闭环：
+当前实现不是系统输入法插件，而是一个“远程粘贴”闭环。这样可以先把中文、emoji、多行文本这些语音识别结果稳定送进任意 App，再决定后续是否需要接入平台原生输入法框架。
+
+## 当前闭环
 
 ```text
-iPhone / Expo 语音识别
-  -> 局域网 POST 文本
-  -> Linux Go daemon
-  -> 写入 Wayland 剪贴板
-  -> 模拟 Ctrl+V
+Android / Expo 客户端
+  -> HTTP POST 文本
+  -> Go daemon 校验 token
+  -> 按平台执行 paste action
   -> 当前焦点窗口收到文本
 ```
 
-当前阶段只考虑这台 Linux/KDE Wayland 机器，不考虑 macOS、Windows、X11、托盘 UI、二维码配对、自动发现或输入法插件。
+平台 action 现在有两条：
 
-## 为什么先用剪贴板
+- macOS：Go daemon 调用 Swift helper，helper 写 `NSPasteboard`、发送 `Command+V`，随后恢复原剪贴板。
+- Linux/KDE Wayland：Go daemon 调用 `wl-copy` 写剪贴板，再用 `ydotool` 模拟 `Ctrl+V`。
 
-语音识别结果天然是一段 Unicode 字符串，尤其是中文、emoji、多行文本。Wayland 下普通进程没有一个通用的 `InsertText("...")` API 可以直接把字符串提交给当前焦点控件。
+客户端协议保持平台无关。客户端发的 `ctrl_v` / `ctrl_shift_v` 表示“普通粘贴/终端粘贴模式”，桌面端按当前平台映射成实际快捷键。
 
-实际可行路径主要是：
+## 项目结构
 
-- 剪贴板粘贴：最适合中文成段文本，最容易跑通。
-- 虚拟键盘：适合按键和英文，不适合直接提交中文字符串。
-- 输入法框架：概念上最正确，但需要接 Fcitx5/IBus，复杂度明显更高。
-- RemoteDesktop/EIS/portal：更符合 Wayland 权限模型，但本质仍是输入事件，不是字符串提交接口。
+```text
+.
+├── main.go                         # HTTP daemon、token 校验、请求处理
+├── paste.go                        # 通用 paste 类型、延迟配置、命令 helper
+├── paste_darwin.go                 # macOS paste action，调用 Swift helper
+├── paste_linux.go                  # Linux paste action，调用 wl-copy/ydotool
+├── paste_unsupported.go            # 未支持平台的明确错误
+├── macos-helper/
+│   ├── Package.swift
+│   └── Sources/VoicePasteHelper/
+│       └── main.swift              # NSPasteboard + CGEvent helper
+├── android-client/                 # Expo/React Native 发送端
+└── test-curl.sh                    # 本机 curl 测试脚本
+```
 
-所以 v0 选择剪贴板粘贴，把复杂度压到最低。
+## HTTP 接口
 
-## v0 架构
+### `GET /health`
 
-### HTTP 接口
+返回：
 
-daemon 提供一个接口：
+```text
+ok
+```
+
+### `POST /type`
 
 ```http
 POST /type
@@ -48,39 +64,117 @@ X-Voice-Paste-Chord: ctrl_v
 - 请求体就是要插入的文本。
 - token 正确时返回 `204 No Content`。
 - token 缺失或错误时返回 `401 Unauthorized`。
-- 文本为空时返回 `400 Bad Request`。
-- 粘贴失败时返回 `500 Internal Server Error`，并记录具体错误。
-- `X-Voice-Paste-Chord` 可选，支持 `ctrl_v` 和 `ctrl_shift_v`。普通 GUI 输入框用 `ctrl_v`，Konsole/终端/Codex 这类目标通常用 `ctrl_shift_v`。
+- 文本为空或全空白时返回 `400 Bad Request`。
+- 请求体超过 1 MiB 时返回 `413 Request Entity Too Large`。
+- 粘贴失败时返回 `500 Internal Server Error`，daemon 日志会记录具体错误。
 
-### 配置
+`X-Voice-Paste-Chord` 可选：
 
-使用环境变量配置：
+- `ctrl_v`：普通 GUI 输入框。
+- `ctrl_shift_v`：终端类目标，或需要 Shift 粘贴的目标。
+
+macOS 下当前映射为：
+
+- `ctrl_v` -> `Command+V`
+- `ctrl_shift_v` -> `Command+Shift+V`
+
+Linux 下当前映射为：
+
+- `ctrl_v` -> `Ctrl+V`
+- `ctrl_shift_v` -> `Ctrl+Shift+V`
+
+## 配置
+
+daemon 使用环境变量配置：
 
 ```text
 VOICE_DAEMON_ADDR=0.0.0.0:47832
 VOICE_DAEMON_TOKEN=<random-token>
 VOICE_DAEMON_PASTE_DELAY_MS=120
+VOICE_DAEMON_RESTORE_DELAY_MS=250
+VOICE_DAEMON_MACOS_HELPER=/path/to/VoicePasteHelper
 ```
 
-默认值：
+说明：
 
 - `VOICE_DAEMON_ADDR` 默认 `0.0.0.0:47832`。
 - `VOICE_DAEMON_TOKEN` 没有默认值；未设置时 daemon 启动失败。
-- `VOICE_DAEMON_PASTE_DELAY_MS` 默认 `120`，用于等待 `wl-copy` 的剪贴板内容就绪后再触发粘贴。
+- `VOICE_DAEMON_PASTE_DELAY_MS` 默认 `120`，写入剪贴板后等待多久再触发粘贴。
+- `VOICE_DAEMON_RESTORE_DELAY_MS` 默认 `250`，macOS 下触发粘贴后等待多久再恢复原剪贴板。
+- `VOICE_DAEMON_MACOS_HELPER` 只在 macOS 下使用。未设置时优先找 `macos-helper/.build/release/VoicePasteHelper`，再找 daemon 同目录下的 `VoicePasteHelper`，最后回退到 `PATH`。
 
 不提供无 token 模式，避免局域网内任意设备都能向当前窗口输入内容。
 
-### MVP 粘贴流程
+## macOS
 
-第一版直接 shell out 到系统工具：
+macOS 路线：
 
 ```text
-1. 收到 POST /type
-2. 校验 Authorization token
-3. 调用 wl-copy，把请求体写入 Wayland 剪贴板，并加敏感内容 hint
-4. 调用 ydotool，模拟 Ctrl+V
-5. 返回 204
+POST /type
+  -> Go daemon
+  -> exec Swift helper，stdin 传 JSON
+  -> helper 保存当前剪贴板
+  -> helper 写 NSPasteboard
+  -> helper 发送 Command+V / Command+Shift+V
+  -> helper 恢复原剪贴板
 ```
+
+先构建 helper：
+
+```bash
+cd macos-helper
+swift build -c release
+cd ..
+```
+
+启动 daemon：
+
+```bash
+export VOICE_DAEMON_TOKEN=test-token
+export VOICE_DAEMON_ADDR=127.0.0.1:47832
+go run .
+```
+
+如果 helper 不在默认位置：
+
+```bash
+export VOICE_DAEMON_MACOS_HELPER=/path/to/VoicePasteHelper
+```
+
+macOS 必须给 helper 或承载它的终端授予辅助功能权限，否则只能写剪贴板，不能发按键：
+
+```text
+System Settings -> Privacy & Security -> Accessibility
+```
+
+### 剪贴板恢复
+
+helper 会尽量保存原 pasteboard 的每个 item、type 和 data，粘贴后再恢复。这样语音文本不会长期覆盖系统剪贴板。
+
+如果某些 App 偶尔粘贴不到，通常是恢复太快，目标 App 还没读取剪贴板。可以调大恢复延迟：
+
+```bash
+export VOICE_DAEMON_RESTORE_DELAY_MS=500
+```
+
+## Linux/KDE Wayland
+
+Linux 路线：
+
+```text
+POST /type
+  -> Go daemon
+  -> wl-copy 写 Wayland 剪贴板
+  -> ydotool 模拟 Ctrl+V / Ctrl+Shift+V
+```
+
+依赖：
+
+- Go
+- Wayland 会话
+- `wl-copy`，通常来自 `wl-clipboard`
+- `ydotool`
+- `/dev/uinput` 权限，或运行 `ydotoold`
 
 等价命令：
 
@@ -90,78 +184,19 @@ sleep 0.12
 ydotool key --key-delay 20 29:1 47:1 47:0 29:0
 ```
 
-其中：
-
-- `29:1` 是 Ctrl down
-- `47:1` 是 V down
-- `47:0` 是 V up
-- `29:0` 是 Ctrl up
-- `--key-delay 20` 让按键事件之间间隔 20ms，比一次性发送更稳
-
-终端模式使用 `Ctrl+Shift+V`：
+终端模式：
 
 ```bash
 ydotool key --key-delay 20 29:1 42:1 47:1 47:0 42:0 29:0
 ```
 
-## KDE 剪贴板历史问题
+如果用户服务可用，推荐启动 `ydotool.service`：
 
-KDE 的当前剪贴板和 Klipper 历史不是同一个东西。
-
-直接使用普通 `wl-copy` 会改变当前剪贴板，也可能被 Klipper 保存到历史。之后清空或恢复剪贴板，只能影响当前剪贴板，不一定能删除已经进入 Klipper 历史的记录。
-
-这意味着 MVP 路线有一个明确副作用：
-
-```text
-语音输入文本可能出现在 Klipper 历史里
+```bash
+systemctl --user enable --now ydotool.service
 ```
 
-v0 会使用 `wl-copy --sensitive` 尽量提示剪贴板管理器这是一段敏感内容。这个选项比裸 `wl-copy` 更好，但仍然需要在 KDE/Klipper 上实测确认是否完全不进历史。
-
-## KDE 感知路线
-
-如果 MVP 可用，但 `wl-copy --sensitive` 仍然不能满足 Klipper 历史控制，下一步改成 daemon 自己设置 MIME data 的 KDE 感知剪贴板写入。
-
-思路是：daemon 不再只调用 `wl-copy`，而是自己设置 clipboard MIME data，同时提供普通文本和 KDE/Klipper 可识别的敏感内容 hint。
-
-目标 MIME data：
-
-```text
-text/plain;charset=utf-8 = <voice text>
-x-kde-passwordManagerHint = secret
-```
-
-预期效果：
-
-- 当前焦点窗口仍然可以通过 `Ctrl+V` 粘贴普通文本。
-- Klipper 看到 `x-kde-passwordManagerHint=secret` 后，应尽量避免把这条内容保存进历史。
-
-注意：
-
-- 这是 KDE/Klipper 约定，不是通用 Linux 剪贴板标准。
-- 不保证所有剪贴板管理器都会尊重这个 hint。
-- 当前 `wl-copy --sensitive` 已经能表达敏感内容 hint；如果它在 KDE 实测不够，再考虑自己实现 clipboard MIME data。
-
-## 运行依赖
-
-MVP 路线需要：
-
-- Go
-- Wayland 会话
-- `wl-copy`，通常来自 `wl-clipboard`
-- `ydotool`
-- `/dev/uinput` 权限，或运行 `ydotoold`
-
-当前机器已确认：
-
-- 会话类型是 Wayland。
-- Go 可用。
-- systemd 可用。
-- `wl-copy` 已安装。
-- `ydotool` 已安装。
-- 用户 `txx` 已加入 `input` 组；需要重新登录后，`ydotool.service` 才能用新的组权限访问 `/dev/uinput`。
-
-如果不想重新登录，也可以临时用 root 启动 ydotoold，并把 socket 暴露给当前用户：
+临时方式可以直接启动 `ydotoold`，并把 socket 暴露给当前用户：
 
 ```bash
 sudo ydotoold \
@@ -170,67 +205,73 @@ sudo ydotoold \
   --socket-own=1000:1000
 ```
 
-重新登录后，推荐使用用户服务：
+### KDE/Klipper 历史
+
+`wl-copy --sensitive` 会尽量提示剪贴板管理器这段内容敏感，但不同剪贴板管理器是否完全尊重这个 hint 需要实测。
+
+KDE 的当前剪贴板和 Klipper 历史不是同一个东西。即使后续清空或恢复当前剪贴板，也不一定能删除已经进入 Klipper 历史的记录。
+
+如果 `wl-copy --sensitive` 不够，下一步可以实现 KDE 感知剪贴板写入，同时提供：
+
+```text
+text/plain;charset=utf-8 = <voice text>
+x-kde-passwordManagerHint = secret
+```
+
+## Android/Expo 客户端
+
+客户端在 `android-client/` 下，是一个 Expo/React Native 发送器。它目前不需要知道桌面端是 macOS、Linux 还是未来的 Windows。
+
+客户端需要配置：
+
+- daemon URL，例如 `http://192.168.1.100:47832`
+- `VOICE_DAEMON_TOKEN`
+- 粘贴模式：GUI / Terminal
+
+运行：
 
 ```bash
-systemctl --user enable --now ydotool.service
+cd android-client
+npm install
+npm run android
 ```
 
-## systemd user service 形态
+## 测试
 
-后续实现 daemon 后，推荐使用 systemd user service 随用户登录启动。
+### Go 单元测试
 
-示例形态：
-
-```ini
-[Unit]
-Description=Mock Voice Input Daemon
-
-[Service]
-ExecStart=/home/txx/workspace/mock_voice_input_methods/mock-voice-daemon
-Environment=VOICE_DAEMON_ADDR=0.0.0.0:47832
-Environment=VOICE_DAEMON_TOKEN=replace-with-random-token
-Restart=on-failure
-
-[Install]
-WantedBy=default.target
+```bash
+go test ./...
 ```
 
-token 不建议长期直接写在公开仓库里的 service 文件中。个人机器上可以放在用户私有的 environment file，或由安装脚本生成。
+### macOS helper 构建
 
-## 测试计划
+```bash
+cd macos-helper
+swift build -c release
+```
 
-### 本机测试
+### 本机 curl 测试
 
-先把焦点放在 KDE 文本编辑器、浏览器输入框或终端里，然后执行：
+启动 daemon：
 
 ```bash
 export VOICE_DAEMON_TOKEN=test-token
 export VOICE_DAEMON_ADDR=127.0.0.1:47832
-
-go build -o mock-voice-daemon .
-./mock-voice-daemon
+go run .
 ```
 
-另开一个终端执行：
+另一个终端发送：
 
 ```bash
-curl -X POST \
-  -H "Authorization: Bearer $VOICE_DAEMON_TOKEN" \
-  --data-binary '你好，世界' \
-  http://127.0.0.1:47832/type
+VOICE_DAEMON_TOKEN=test-token ./test-curl.sh '你好，世界'
 ```
 
-也可以使用仓库里的测试脚本：
+如果需要先把焦点切到目标输入框，可以延迟发送：
 
 ```bash
-./test-curl.sh '你好，世界'
+sleep 3; VOICE_DAEMON_TOKEN=test-token ./test-curl.sh '你好，macOS'
 ```
-
-预期：
-
-- 当前焦点窗口收到 `你好，世界`。
-- HTTP 返回 `204`。
 
 ### 局域网测试
 
@@ -240,17 +281,15 @@ curl -X POST \
 curl -X POST \
   -H "Authorization: Bearer <token>" \
   --data-binary '来自手机的中文语音文本' \
-  http://<pc-lan-ip>:47832/type
+  http://<desktop-lan-ip>:47832/type
 ```
 
 预期：
 
-- PC 当前焦点窗口收到文本。
+- 当前焦点窗口收到文本。
 - token 错误时返回 `401`。
 
-### 文本类型测试
-
-需要覆盖：
+建议覆盖：
 
 - 中文
 - 英文
@@ -258,26 +297,33 @@ curl -X POST \
 - 多行文本
 - 长文本
 - 空文本
+- 普通输入框
+- Terminal/iTerm
 
-### Klipper 历史测试
+## systemd user service 示例
 
-MVP 路线：
+Linux 上后续可以用 systemd user service 随用户登录启动：
 
-- 发送一段测试文本。
-- 打开 Klipper 历史。
-- 记录该文本是否进入历史。
+```ini
+[Unit]
+Description=Mock Voice Input Daemon
 
-KDE 感知路线：
+[Service]
+ExecStart=/home/txx/workspace/mock_voice_input_method/mock-voice-daemon
+Environment=VOICE_DAEMON_ADDR=0.0.0.0:47832
+Environment=VOICE_DAEMON_TOKEN=replace-with-random-token
+Restart=on-failure
 
-- 使用带 `x-kde-passwordManagerHint=secret` 的 clipboard 写入实现。
-- 重复发送测试文本。
-- 检查 Klipper 是否跳过历史记录。
+[Install]
+WantedBy=default.target
+```
 
-## 迭代顺序
+token 不建议写进公开仓库。个人机器上可以放在用户私有的 environment file，或由安装脚本生成。
 
-1. 实现 Go HTTP daemon 和 token 校验。
-2. 接入 `wl-copy` 和 `ydotool`，完成 MVP 粘贴。
-3. 添加基础日志和错误返回。
-4. 增加 systemd user service。
-5. 实测 Klipper 历史污染。
-6. 如有必要，改造为 KDE 感知剪贴板写入。
+## 后续路线
+
+- macOS：如果每次 `exec` helper 的方式不够理想，可以升级为常驻 helper，通过 Unix domain socket 或 XPC 与 Go daemon 通信。
+- macOS：如果裸 CLI 的辅助功能授权体验不稳定，可以把 helper 包成 `.app` 或 LaunchAgent。
+- Linux/KDE：继续实测 Klipper 历史污染，必要时实现 KDE MIME hint 的原生剪贴板写入。
+- Windows：保留现有 HTTP 协议，新增 Windows paste action，可用 Win32 clipboard + `SendInput` 实现。
+- 客户端：协议稳定后再考虑二维码配对、自动发现、token 管理和更完整的语音识别体验。
